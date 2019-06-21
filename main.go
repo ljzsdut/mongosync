@@ -23,7 +23,6 @@ func main() {
 	// 使用--oplog参数，强烈不建议使用nsFrom_To参数和dbFrom_To 参数. TODO:考虑使用clone函数进行重放完成后，先克隆然后删除旧集合
 
 	/*
-
 		mongosync  基于快照模式的同步
 		mongosync -h
 		mongoysnc --src_host "HOST" --src_port "PORT" --dst_host "HOST"  --dst_port "PORT"
@@ -56,17 +55,17 @@ func main() {
 	)
 
 	// 连接mongodb相关参数
-	flag.StringVar(&src_host, "src_host", "0.0.0.0", "the source mongodb server's ip")
-	flag.IntVar(&src_port, "src_port", 27017, "the source mongodb server's port")
-	flag.StringVar(&src_user, "src_user", "", "the source mongodb server's logging user")
-	flag.StringVar(&src_passwd, "src_passwd", "", "the source mongodb server's logging password")
-	flag.StringVar(&src_auth_db, "src_auth_db", "", "the source mongodb server's auth db")
+	flag.StringVar(&src_host, "sh", "0.0.0.0", "the source mongodb server's ip")
+	flag.IntVar(&src_port, "sP", 27017, "the source mongodb server's port")
+	flag.StringVar(&src_user, "su", "", "the source mongodb server's logging user")
+	flag.StringVar(&src_passwd, "sp", "", "the source mongodb server's logging password")
+	flag.StringVar(&src_auth_db, "sd", "", "the source mongodb server's auth db")
 
-	flag.StringVar(&dst_host, "dst_host", "", "the destination mongodb server's ip")
-	flag.IntVar(&dst_port, "dst_port", 27017, "the destination mongodb server's port")
-	flag.StringVar(&dst_user, "dst_user", "", "the destination mongodb server's logging user")
-	flag.StringVar(&dst_passwd, "dst_passwd", "", "the destination mongodb server's logging password")
-	flag.StringVar(&dst_auth_db, "dst_auth_db", "", "the destination mongodb server's auth db")
+	flag.StringVar(&dst_host, "dh", "", "the destination mongodb server's ip")
+	flag.IntVar(&dst_port, "dP", 27017, "the destination mongodb server's port")
+	flag.StringVar(&dst_user, "du", "", "the destination mongodb server's logging user")
+	flag.StringVar(&dst_passwd, "dp", "", "the destination mongodb server's logging password")
+	flag.StringVar(&dst_auth_db, "dd", "", "the destination mongodb server's auth db")
 
 	// 是否启用oplog进行增量同步；是否将oplog同步到目标mongodb实例中；oplog和sync_oplog互斥
 	flag.BoolVar(&oplog, "oplog", false, "whether to enable oplog for incremental synchronization")
@@ -91,6 +90,7 @@ func main() {
 	// flag.StringVar(&query, "query", "", "query filter, as a JSON string, e.g., '{x:{$gt:1}}'") // TODO
 
 	flag.Parse()
+
 	if dst_host == "" {
 		fmt.Println("未指定--dst_host参数，请使用合理的参数:")
 		flag.Usage()
@@ -103,9 +103,7 @@ func main() {
 	if oplog != false && sync_oplog != false {
 		log.Fatalln("--oplog与--sync_oplog参数互斥，不能同时使用")
 	}
-	// if nsFrom_To != "" && dbFrom_To != "" {
-	// 	log.Fatalln("--nsFrom_To与--dbFrom_To参数互斥，不能同时使用")
-	// }
+
 
 	src := utils.NewMongoArgs()
 	src.SetHost(src_host)
@@ -121,24 +119,25 @@ func main() {
 	dst.SetPassword(dst_passwd)
 	dst.SetAuthenticationDatabase(dst_auth_db)
 
-	// 在所有连接src库进行操作之前，获取当前最新的oplog对应的timestamp
+	// 使用--oplog或--sync_oplog参数时：在所有连接src库进行操作之前，获取当前最新的oplog对应的timestamp
 	var (
 		start_ts, end_ts primitive.Timestamp
 		err              error
 	)
 	if sync_oplog || oplog {
-		start_ts, err = utils.CustGetLatestOplogTimestamp(src)
+		start_ts, err = utils.CustGetLatestOplogTimestamp(src)  //该函数执行需要访问admin库
 		if err != nil {
-			log.Fatalln("获取当前最新的oplog对应的timestamp失败：", err)
+			log.Fatalln("获取当前最新的oplog对应的timestamp失败,请确认用户是否可以访问admin库(src)：", err)
 		}
 	}
 
+	//--------------------------------------------------------------------------------------------
 	// 分析db列表 ：dbSlice
 	var (
-		dbSlice []string // dbSlice是要同步的db切片
-		nsSlice []string // nsSlice是要同步的ns切片
+		dbSlice []string // dbSlice是<最终>要同步的db切片
+		nsSlice []string // nsSlice是<最终>要同步的ns切片
 	)
-	if db != "" {
+	if db != "" {   // db参数的的格式：<database-name,...>
 		srcAllDbs := utils.CustGetDbs(src)
 		cmdDbs := strings.Split(db, ",")
 		srcAllDbsSet := set.New(set.ThreadSafe)
@@ -156,23 +155,24 @@ func main() {
 	// dbSlice是要同步的db切片
 	//--------------------------------------------------------------------------------------------
 
-	// 使用集合操作进行过滤：nsSlice
+	// 使用集合操作进行nsInclude和nsExclude参数过滤：nsSlice
 	allNsSet := set.New(set.ThreadSafe)  // 未经过nsInclude和nsExclude参数过滤的所有的ns,放在集合allNsSet中
 	taskNsSet := set.New(set.ThreadSafe) // 经过nsInclude和nsExclude参数过滤的所有的ns,放在集合taskNsSet中
 
+	// 将dbSlicce转换为ns格式的集合－－>allNsSet
 	for _, SrcDb := range dbSlice {
 		for _, SrcColl := range utils.CustGetColls(src, SrcDb) {
 			allNsSet.Add(fmt.Sprintf("%s.%s", SrcDb, SrcColl))
 		}
 	}
 
-	if nsExclude != "" { // 对allNsSet使用nsInclude和nsExclude参数进行过滤过滤，最终有效ns放在nsSlice这个切片中。
+	if nsExclude != "" { // 对allNsSet使用--nsInclude和--nsExclude参数进行过滤过滤，最终有效ns放在nsSlice这个切片中。
 		nsExcludeSet := set.New(set.ThreadSafe)
 		for _, ns := range strings.Split(nsExclude, ",") {
 			nsExcludeSet.Add(ns)
 		}
 		taskNsSet = set.Difference(allNsSet, nsExcludeSet) // 差集
-	} else if nsInclude != "" {
+	} else if nsInclude != "" {  // --nsExclude参数和--nsInclude参数互斥
 		nsIncludeSet := set.New(set.ThreadSafe)
 		for _, ns := range strings.Split(nsInclude, ",") {
 			nsIncludeSet.Add(ns)
@@ -181,17 +181,18 @@ func main() {
 	} else {
 		taskNsSet = allNsSet
 	}
-	nsSlice = set.StringSlice(taskNsSet) // 元素： db.coll
+	nsSlice = set.StringSlice(taskNsSet) // 元素格式为： db.coll
 	sort.Strings(nsSlice)
 	// nsSlice是要同步的ns切片
 	//--------------------------------------------------------------------------------------------
 
-	// nsFrom_To、dbFrom_To参数处理
-	nsnsMap := make(map[string]string) // nsnsMap是要ns映射的字典
+	// --nsFrom_To、--dbFrom_To参数处理
+	nsnsMap := make(map[string]string) // nsnsMap是要ns映射的字典，元素形如：dbFrom.[coll|$cmd]:dbTo.[coll|$cmd}
 	var errmaps []string
-	if dbFrom_To != "" {
+	// 只将dbname进行映射，collname保持不变，保存为nsnsMap
+	if dbFrom_To != "" {  // Format:<src_dbname:dst_dbname,...>
 		for _, dbmap := range strings.Split(dbFrom_To, ",") {
-			reg := regexp.MustCompile(`^([^:]+)\:([^:]+)$`)
+			reg := regexp.MustCompile(`^([^:]+)\:([^:]+)$`)  // 正则字符串：非冒号开头和结尾，但是中间必须有冒号
 			if reg.MatchString(dbmap) {
 				dbFrom := strings.SplitN(dbmap, ":", 2)[0]
 				dbTo := strings.SplitN(dbmap, ":", 2)[1]
@@ -208,13 +209,14 @@ func main() {
 		}
 	}
 
-	if nsFrom_To != "" {
+	// 只将dbname进行映射，collname保持不变，保存为nsnsMap
+	if nsFrom_To != "" {  // Format:<src_namespace:dst_namespace,...>
 		for _, nsmap := range strings.Split(nsFrom_To, ",") {
 			reg := regexp.MustCompile(`^([^.:]+)\.([^:]+)\:([^.:]+)\.([^:]+)$`)
 			if reg.MatchString(nsmap) {
 				key := strings.SplitN(nsmap, ":", 2)[0]
 				value := strings.SplitN(nsmap, ":", 2)[1]
-				nsnsMap[key] = value
+				nsnsMap[key] = value   // 对于已经存在的key,进行跟新；如果不存在，直接创建
 			} else {
 				errmaps = append(errmaps, nsmap)
 			}
@@ -223,13 +225,15 @@ func main() {
 			log.Fatalln("--nsFrom_To参数格式错误：", errmaps)
 		}
 	}
-	// nsnsMap是要ns映射的字典
+	// nsnsMap是要ns映射的字典。表示需要进行转换的的ns
 
 	//-------------------------------------------------------------------------------------------
+	// 将nsSlice中的ns转换成utils.NsMap结构体
 	var nsStructSlice []*utils.NsMap
 	for _, ns := range nsSlice { // ns格式：db.coll
 		nsStructSlice = append(nsStructSlice, utils.CustFilter(ns, nsnsMap))
 	}
+	// nsStructSlice是最终要进行操作的对象
 
 	fmt.Println("即将对以下集合进行操作：")
 	for _, task := range nsStructSlice {
@@ -238,7 +242,7 @@ func main() {
 
 	var answer string
 label:
-	fmt.Print("请确认以上信息是否正确，输入[yes]继续，输入[no]退出：")
+	fmt.Print("请确认以上信息是否正确，输入[yes|YES]继续，输入[no|NO]退出：")
 	fmt.Scanln(&answer)
 	if "YES" == strings.TrimSpace(answer) || "yes" == strings.TrimSpace(answer) {
 		//continue
@@ -250,14 +254,14 @@ label:
 
 	//-------------------------------------------------------------------------------------------
 	if !replayoplog {
-		// 生产者
+		// 生产者，不断地将nsStructSlice中的元素放入nsQueue
 		var nsQueue = make(chan *utils.NsMap, 20)
-		go func(taskQueue chan *utils.NsMap, nsSlice []string) {
+		go func(taskQueue chan *utils.NsMap, nsStructSlice []*utils.NsMap) {
 			for _, nsmap := range nsStructSlice {
 				nsQueue <- nsmap
 			}
 			close(taskQueue)
-		}(nsQueue, nsSlice)
+		}(nsQueue, nsStructSlice)
 
 		//消费者：不断地从nsQueue中获取task来运行CustSyncCollection函数，直到nsQueue关闭
 		worker := func(wg *sync.WaitGroup) {
@@ -280,7 +284,7 @@ label:
 			log.Println("开始进行oplog同步至目标mongodb实例...")
 			fmt.Printf("请使用--replayoplog --src_op_ns \"syncoplog.oplog.rs\" --op_start \"%d,%d\" 等参数进行oplog重放\n", start_ts.T, start_ts.I)
 			go utils.CustSyncOplog(src, dst, start_ts)
-			// 捕获ctrl+c，进行--replayoplog相关参数的提示
+			// 捕获ctrl+c，进行--replayoplog相关参数的提示并退出sync_oplog操作
 			func() {
 				c := make(chan os.Signal, 1)
 				signal.Notify(c, os.Interrupt) //signal包不会为了向c发送信息而阻塞（就是说如果发送时c阻塞了，signal包会直接放弃）.调用者应该保证c有足够的缓存空间可以跟上期望的信号频率。对使用单一信号用于通知的通道，缓存为1就足够了。
@@ -293,7 +297,7 @@ label:
 			utils.CustReplayOplog(src, dst, start_ts, end_ts, "local.oplog.rs", nsSlice, nsnsMap)
 		}
 	} else {
-		// start_ts
+		// 获取start_ts
 		if op_start == "0,0" {
 			log.Fatalln("--op_start为必选参数，请正确指定--op_start参数")
 		} else {
@@ -319,7 +323,7 @@ label:
 		end_ts = primitive.Timestamp{uint32(T), uint32(I)}
 
 		utils.CustReplayOplog(src, dst, start_ts, end_ts, src_op_ns, nsSlice, nsnsMap)
-		log.Println("oplog重放完毕，如果需要，请手动删除syncoplog库！")
+		log.Println("oplog重放完毕，如果需要，请手动删除dst实例中的syncoplog库！")
 		// defer 删除syncoplog库
 	}
 }

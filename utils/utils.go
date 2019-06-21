@@ -31,6 +31,17 @@ type MongoArgs struct {
 	authenticationDatabase string
 }
 
+type OPLOG struct {
+	TS primitive.Timestamp `bson:"ts"`
+	T  int64 `bson:"t"`
+	H  int64 `bson:"h"`
+	V  int `bson:"v"`
+	OP string `bson:"op"`
+	NS string `bson:"ns"`
+	O2 interface{} `bson:"o2"`
+	O  interface{} `bson:"o"`
+}
+
 // MongoArgs的构造函数
 func NewMongoArgs() *MongoArgs {
 	return &MongoArgs{
@@ -110,7 +121,7 @@ func (mc *MongoArgs) Connect() *mongo.Client {
 	return conn
 }
 
-func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string /*wg *sync.WaitGroup*/) {
+func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string) {
 	// 查看索引
 	srcClient := srcMongo.Connect()
 	defer srcClient.Disconnect(srcMongo.ctx)
@@ -184,7 +195,6 @@ func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, ds
 			log.Fatalf("db[%s].coll[%s]索引[%s]添加失败：%v\n", dstDbName, dstCollName, *(indexopt.Name), err)
 		}
 	}
-	// wg.Done()
 }
 
 func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string, updateOverwrite bool, no_index bool) {
@@ -336,7 +346,7 @@ func CustGetLatestOplogTimestamp(srcMongo *MongoArgs) (primitive.Timestamp, erro
 		if member.(bson.M)["stateStr"] == "PRIMARY" {
 			if reflect.TypeOf(member.(bson.M)["optime"]).Kind() == reflect.Map { // version≥3.2
 				return member.(bson.M)["optime"].(bson.M)["ts"].(primitive.Timestamp), nil
-			} else {
+			} else { // version<3.2
 				return member.(bson.M)["optime"].(primitive.Timestamp), nil
 			}
 		}
@@ -366,16 +376,14 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 	defer dstClient.Disconnect(context.Background())
 
 	srcColl := srcClient.Database(srcOplogNsSlice[0]).Collection(srcOplogNsSlice[1])
-
 	// 验证start_ts有效性，如果失效，直接退出。
 	var firstoplog bson.M
 	err = srcColl.FindOne(context.Background(), bson.M{"ts": bson.M{"$gte": start_ts}}).Decode(&firstoplog)
 	if err != nil {
 		log.Fatalln("验证start_ts有效性时，查询失败：", err)
 	} else if !firstoplog["ts"].(primitive.Timestamp).Equal(start_ts) {
-		log.Fatalln("由于固定集合local.oplog_rs的size太小或者备份时间太长，导致start_ts指定的oplog已经被覆盖，终止oplog重放操作!请使用--sync_oplog参数重新进行同步操作，此时会将oplog记录到目标mongodb中的syncoplog.oplog.rs中，然后使用--replayoplog参数手动重放")
+		log.Fatalf("由于固定集合%s的size太小或者全量备份时间太长，导致start_ts指定的那条oplog记录已经被覆盖，终止oplog重放操作!请使用--sync_oplog参数重新进行同步操作，此时会将oplog记录到目标mongodb中的syncoplog.oplog.rs中，然后使用--replayoplog参数手动重放", srcOplogNamespace)
 	}
-
 	// Tailable游标只能用在固定集合上,如果oplog来源自local.oplog.rs，则使用Tailable，否则使用NonTailable
 	// 判断end_ts是否为空,如果为空，则或者从start_ts开始的所有记录
 	var filter bson.D
@@ -419,7 +427,11 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 	}
 	defer cur.Close(context.Background())
 
-	var oplog bson.M // TODO: bson.D格式的处理
+	var (
+		oplog OPLOG
+		oplogBsonD primitive.D
+	)
+	//var oplog_bsonD bson.D // TODO: bson.D格式的处理
 	for cur.Next(context.Background()) {
 		// 获取oplog记录
 		if err := cur.Err(); err != nil {
@@ -429,16 +441,21 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 		if err != nil {
 			log.Fatal(err)
 		}
-
+		err = cur.Decode(&oplogBsonD)
+		if err != nil {
+			log.Fatal(err)
+		}
 		// 测试当前oplog是不是当前最新的oplog（新产生的oplog）。
 		// 只适用于固定集合local.oplog.rs。对于指定end_ts的情况（不为空）无需进行判断
 		if srcOplogNamespace == "local.oplog.rs" && end_ts.T == 0 && end_ts.I == 0 {
 			current_ts, err := CustGetLatestOplogTimestamp(srcMongo)
 			if err != nil {
 				log.Println("获取当前最新的oplog对应的timestamp失败：", err)
-			} else if current_ts.Equal(oplog["ts"].(primitive.Timestamp)) {
+			} else if current_ts.Equal(oplog.TS) {
+				//} else if current_ts.Equal(oplog[0].Value.(primitive.Timestamp)) {
 				// 比较oplog中的timestamp和当前最新的timestamp是否相等
-				log.Println("正在实时重放当前最新生成的oplog，您可以\"ctrl+c\"手动终止程序!  当前oplog为:", oplog)
+				log.Println("正在实时重放当前最新生成的oplog，您可以\"ctrl+c\"手动终止程序!  当前oplog为:", oplogBsonD)
+			} else {
 			}
 		}
 
@@ -448,48 +465,61 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 			nsStruct := CustFilter(fmt.Sprintf("%s.%s", dstDbName, dstCollName), nsnsMap) //  对ns进行名称空间映射处理
 			dstDb := dstClient.Database(nsStruct.DstDb)
 			dstColl := dstDb.Collection(nsStruct.DstColl)
-			switch oplog["op"] {
+			switch oplog.OP {
 			case "i":
-				if _, exists := oplog["o"].(bson.M)["_id"]; exists {
+				if _, exists := oplog.O.(bson.D).Map()["_id"]; exists {
 					ReplaceOneOpts := options.Replace()
 					ReplaceOneOpts.SetUpsert(true)
-					_, err := dstColl.ReplaceOne(context.Background(), bson.M{"_id": oplog["o"].(bson.M)["_id"]}, oplog["o"], ReplaceOneOpts)
+					_, err := dstColl.ReplaceOne(context.Background(), bson.M{"_id": oplog.O.(bson.D).Map()["_id"]}, oplog.O, ReplaceOneOpts)
 					if err != nil {
-						log.Println("oplog执行'i'操作失败：", err, "\toplog内容：", oplog)
+						log.Println("oplog执行'i'操作失败：", err, "\toplog内容：", oplogBsonD)
 					}
 				} else {
 					// 创建索引的oplog
 					indexopt := options.Index()
-					indexopt.SetName(oplog["o"].(bson.M)["name"].(string))
+					indexopt.SetName(oplog.O.(bson.D).Map()["name"].(string))
 					indexopt.SetBackground(true)
 
 					indexmodel := mongo.IndexModel{}
-					indexmodel.Keys = oplog["o"].(bson.M)["key"]
+					indexmodel.Keys = oplog.O.(bson.D).Map()["key"]
 					indexmodel.Options = indexopt
 					_, err := dstColl.Indexes().CreateOne(context.Background(), indexmodel)
 					if err != nil {
-						log.Println("oplog创建索引失败：", err, "\toplog内容：", oplog)
+						log.Println("oplog创建索引失败：", err, "\toplog内容：", oplogBsonD)
 					}
 				}
 			case "u":
-				_, err := dstColl.UpdateOne(context.Background(), oplog["o2"], oplog["o"])
-				if err != nil {
-					log.Println("oplog执行'u'操作失败：", err, "\toplog内容：", oplog)
+				if _, exists := oplog.O.(bson.D).Map()["$set"]; exists {
+					UpdateOpts:=options.Update()
+					UpdateOpts.SetUpsert(true)
+					UpdateOpts.SetBypassDocumentValidation(false)
+
+					_, err := dstColl.UpdateOne(context.Background(), oplog.O2,oplog.O,UpdateOpts)  // update操作
+					if err != nil {
+						log.Println("oplog执行'u'操作失败：", err, "\toplog内容：", oplogBsonD)
+					}
+				} else {
+					ReplaceOneOpts := options.Replace()
+					ReplaceOneOpts.SetUpsert(true)
+					_, err := dstColl.ReplaceOne(context.Background(), oplog.O2,oplog.O,ReplaceOneOpts)  // replace操作
+					if err != nil {
+						log.Println("oplog执行'u'操作失败：", err, "\toplog内容：", oplogBsonD)
+					}
 				}
 			case "d":
-				_, err := dstColl.DeleteOne(context.Background(), oplog["o"])
+				_, err := dstColl.DeleteOne(context.Background(), oplog.O)
 				if err != nil {
-					log.Println("oplog执行'd'操作失败：", err, "\toplog内容：", oplog)
+					log.Println("oplog执行'd'操作失败：", err, "\toplog内容：", oplogBsonD)
 				}
 			case "c": // command,集合映射时，可能导致失败
-				res := dstDb.RunCommand(context.Background(), oplog["o"])
+				res := dstDb.RunCommand(context.Background(), oplog.O)
 				if err := res.Err(); err != nil {
-					log.Println("oplog执行'c'操作失败：", err, "\toplog内容：", oplog)
+					log.Println("oplog执行'c'操作失败：", err, "\toplog内容：", oplogBsonD)
 				}
 			case "n":
 				// noop：do nothing
 			default:
-				log.Println("未识别的oplog操作：", "\toplog内容：", oplog)
+				log.Println("未识别的oplog操作：", "\toplog内容：", oplogBsonD)
 			}
 		}
 	}
@@ -497,19 +527,19 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 
 //根据oplog获取oplog对应的Namespace。
 // noop类型的oplog返回空；command类型的oplog，第二个返回值为:$cmd
-func CustGetOplogNs(oplog bson.M) (string, string) {
+func CustGetOplogNs(oplog OPLOG) (string, string) {
 	defer func() {
 		if err := recover(); err != nil {
 			log.Println(err, "\toplog内容：", oplog)
 		}
 	}()
 
-	if oplog["ns"].(string) != "" { // 非o="n"的oplog,其ns为空
+	if oplog.NS != "" { // 非o="n"的oplog,其ns为空
 		var NS []string
-		_, exists := oplog["o"].(bson.M)["_id"] //如果oplog["o"]中存在"_id"字段，表示普通类型的insert操作；否则为创建索引的操作
-		if oplog["op"] == "i" && !exists {
+		_, exists := oplog.O.(bson.D).Map()["_id"] //如果oplog["o"]中存在"_id"字段，表示普通类型的insert操作；否则为创建索引的操作
+		if oplog.OP == "i" && !exists {
 			// 针对于创建索引的i类型的oplog。
-			NS = strings.SplitN(oplog["o"].(bson.M)["ns"].(string), ".", 2)
+			NS = strings.SplitN(oplog.O.(bson.D).Map()["ns"].(string), ".", 2)
 			// 	例如：
 			// 	{
 			// 		"ts" : Timestamp(1553916471, 1),
@@ -529,7 +559,7 @@ func CustGetOplogNs(oplog bson.M) (string, string) {
 			// }
 		} else {
 			// 针对于普通类i类型及其他各种类型的oplog。
-			NS = strings.SplitN(oplog["ns"].(string), ".", 2)
+			NS = strings.SplitN(oplog.NS, ".", 2)
 			// 	例如：普通的i类型的oplog
 			// 	{
 			// 		"ts" : Timestamp(1547796424, 1),
@@ -548,7 +578,7 @@ func CustGetOplogNs(oplog bson.M) (string, string) {
 			// 				"servicetype" : ""
 			// 		}
 			// }
-			// 	例如： u类型的oplog
+			// 	例如： u类型的oplog(update操作)
 			// 	{
 			// 		"ts" : Timestamp(1553916741, 1),
 			// 		"t" : NumberLong(7),
@@ -565,6 +595,24 @@ func CustGetOplogNs(oplog bson.M) (string, string) {
 			// 				}
 			// 		}
 			// }
+			// 	例如： u类型的oplog(replace操作)
+			//{
+			//		"ts" : Timestamp(1561014006, 1),
+			//		"t" : NumberLong(1),
+			//		"h" : NumberLong("-3250511269367634318"),
+			//		"v" : 2,
+			//		"op" : "u",
+			//		"ns" : "GlobalDB.GlobalService",
+			//		"o2" : { "_id" : ObjectId("5d09c820612622a9758da8ee") },
+			//		"o" : {
+			//				"_id" : ObjectId("5d09c820612622a9758da8ee"),
+			//				"id" : "baa00001", "servicename" : "PPPPPPPPPPPPPPPPPPP",
+			//				"serviceindex" : "Tp.Sys.CustomObject.Query",
+			//				"serviceobject" : "CustomObjectSetupService.query",
+			//				"servicepath" : "com.g3cloud.platform.ui.setup.service.customobjects",
+			//				"servicetype" : "1112"
+			//		}
+			//}
 			// 	例如： c类型的oplog，较特殊，coll为 "$cmd"
 			// 	{
 			// 		"ts" : Timestamp(1553916897, 1),
@@ -609,6 +657,7 @@ func CustGetOplogNs(oplog bson.M) (string, string) {
 	// }
 }
 
+// 从src库同步oplog到dst的库中，用于手动重放
 func CustSyncOplog(srcMongo *MongoArgs, dstMongo *MongoArgs, start_ts primitive.Timestamp) {
 	// TODO: 处理网络断开，自动重连——比如dbserver重启后自动重连
 	// TODO:  判断如果syncoplog库存在数据，退出
