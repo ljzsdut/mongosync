@@ -9,6 +9,7 @@ import (
 	"log"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -38,10 +39,10 @@ func NewLogger() *zap.Logger {
 			LineEnding:   zapcore.DefaultLineEnding,
 			EncodeLevel:  zapcore.LowercaseLevelEncoder,
 			EncodeTime:   zapcore.ISO8601TimeEncoder, // TimeKey对应的值（时间格式）
-			EncodeCaller: zapcore.ShortCallerEncoder, //CallerKey对应的值
+			EncodeCaller: zapcore.ShortCallerEncoder, // CallerKey对应的值
 		},
-		OutputPaths:      []string{"stdout", "./zap.log"},
-		ErrorOutputPaths: []string{"stderr", "./zap.log"},
+		OutputPaths:      []string{"stdout", "./mongosync.log"},
+		ErrorOutputPaths: []string{"stderr", "./mongosync.log"},
 	}
 	logger, err := cfg.Build()
 	if err != nil {
@@ -299,9 +300,8 @@ func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName strin
 		}
 	}
 	end := time.Now()
-	duration := end.Sub(start).Seconds()
-	//logger.Info("collection数据导入完成",zap.String("NS",srcDbName+"."+srcCollName),zap.Int64("insertedCount",insertedNum))
-	fmt.Printf("%s数据导入完成，导入数量：%v\n，耗时：%v秒", srcDbName+"."+srcCollName, insertedNum, duration)
+	duration := fmt.Sprintf("%.2f", end.Sub(start).Seconds())
+	fmt.Printf("%s数据导入完成，导入数量：%v，耗时：%v秒\n", srcDbName+"."+srcCollName, insertedNum, duration)
 }
 
 // 对mongo.Collection对象进行批量插入，如果批量插入失败，则转换为逐条插入
@@ -309,57 +309,87 @@ func CustInsertMany(coll *mongo.Collection, docs []interface{}, updateOverwrite 
 	// 设置	InsertMany相关参数
 	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	insertManyOpts := options.InsertMany()
-	insertManyOpts.SetOrdered(true)
+	insertManyOpts.SetOrdered(false)                  // true:按docs顺序逐条插入，遇到错误，终止插入；  false：:按docs顺序逐条插入，遇到错误，跳过错误的记录，继续插入后面的记录
 	insertManyOpts.SetBypassDocumentValidation(false) //Mongodb提供了在插入和更新时验证文档的功能。就是一种约束条件
 
-	insertManyResult, err := coll.InsertMany(context.Background(), docs, insertManyOpts)
-	insertedlen := int64(len(insertManyResult.InsertedIDs))
+	docsNum := int64(len(docs))
+	_, err := coll.InsertMany(context.Background(), docs, insertManyOpts) // insertManyResult无论是否插入成功，都会显示docs中所有的_id
 	if err != nil {
-		for _, doc := range docs {
-			// 设置	InsertOne相关参数
-			insertOneOpts := options.InsertOne()
-			insertOneOpts.SetBypassDocumentValidation(false)
-			//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+		var docsChan = make(chan interface{}, 1000)
+		var lock sync.Mutex
+		// 生产者
+		go func(docsChan chan interface{}) {
+			for _, doc := range docs {
+				docsChan <- doc
+			}
+			close(docsChan)
+		}(docsChan)
 
-			insertOneResult, err := coll.InsertOne(ctx, doc, insertOneOpts)
-			if err != nil {
-				// 如果是违反唯一约束，说明记录已经插入了，更新操作或跳过;否则记录错误
-				if strings.Contains(err.Error(), "E11000 duplicate key error") {
-					// 是否对重复记录采用update
-					if updateOverwrite { // 采用replaceOne方式，覆盖已经存在的_id记录
-						// 设置	InsertOne相关参数
-						ReplaceOneOpts := options.Replace()
-						ReplaceOneOpts.SetBypassDocumentValidation(false)
-						ReplaceOneOpts.SetUpsert(true)
-						//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-						filter := bson.M{"_id": doc.(bson.D).Map()["_id"]}
-						replaceOne, err := coll.ReplaceOne(ctx, filter, doc, ReplaceOneOpts)
-						if err != nil { // ReplaceOne操作失败，failNum加1
-							failNum++
-							logger.Error(err.Error(),  zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
-						} else {
-							sucessNum++
-							logger.Debug("ReplaceOne操作成功", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("UpsertedID", fmt.Sprintf("%v", replaceOne.UpsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
-						}
-					} else { // 忽略_id已经存在的记录，不做任何操作
-						sucessNum++
-						logger.Debug(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
-					}
-				} else { // 非违反唯一键约束的错误，failNum加1
+		// 业务
+		insertManyErrHandler := func(doc interface{}) {
+			if updateOverwrite { // 采用replaceOne方式，覆盖已经存在的_id记录
+				ReplaceOneOpts := options.Replace()
+				ReplaceOneOpts.SetBypassDocumentValidation(false) //Mongodb提供了在插入和更新时验证文档的功能。就是一种约束条件
+				ReplaceOneOpts.SetUpsert(true)                    // 如果未查询到，则新建
+				filter := bson.M{"_id": doc.(bson.D).Map()["_id"]}
+				replaceOne, err := coll.ReplaceOne(ctx, filter, doc, ReplaceOneOpts)
+				if err != nil { // ReplaceOne操作失败，failNum加1
+					lock.Lock()
 					failNum++
-					logger.Error(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
-
+					lock.Unlock()
+					logger.Error(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("doc", fmt.Sprintf("%v", doc)))
+				} else {
+					lock.Lock()
+					sucessNum++
+					lock.Unlock()
+					logger.Debug("ReplaceOne操作成功", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("UpsertedID", fmt.Sprintf("%v", replaceOne.UpsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
 				}
-			} else {
-				sucessNum++
-				logger.Debug("insertOne操作成功",  zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("InsertedID", fmt.Sprintf("%v", insertOneResult.InsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
+			} else { // 采用insertOne方式，忽略_id已经存在的记录，不做任何操作
+				insertOneOpts := options.InsertOne()
+				insertOneOpts.SetBypassDocumentValidation(true)
+				insertOneResult, err := coll.InsertOne(ctx, doc, insertOneOpts)
+				if err != nil {
+					if strings.Contains(err.Error(), "E11000 duplicate key error") { // 1、违反唯一约束错误，忽略错误
+						lock.Lock()
+						sucessNum++
+						lock.Unlock()
+						logger.Debug(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("doc", fmt.Sprintf("%v", doc)))
+					} else { // 2、除唯一约束错误之外的其他错误
+						lock.Lock()
+						failNum++
+						lock.Unlock()
+						logger.Error(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("doc", fmt.Sprintf("%v", doc)))
+					}
+				} else { // 3、没有错误
+					lock.Lock()
+					sucessNum++
+					lock.Unlock()
+					logger.Debug("InsertOne操作成功", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("UpsertedID", fmt.Sprintf("%v", insertOneResult.InsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
+				}
 			}
 		}
-	} else {  // InsertMany批量插入成功
-		sucessNum += int64(insertedlen)
-		logger.Debug("InsertMany批量插入数据", zap.String("NS", coll.Database().Name()+"."+coll.Name()),  zap.Int64("insertedlen", insertedlen), zap.String("InsertedIDs", fmt.Sprintf("%v", insertManyResult.InsertedIDs)))
+
+		// 消费者：
+		worker := func(wg *sync.WaitGroup) {
+			for doc := range docsChan { // channel是线程安全的，多个消费者可以同时操作channel
+				insertManyErrHandler(doc)
+			}
+			wg.Done()
+		}
+
+		//WorkerPool
+		func(numOfWorkers int) {
+			var wg sync.WaitGroup
+			for i := 0; i < numOfWorkers; i++ {
+				wg.Add(1)
+				go worker(&wg)
+			}
+			wg.Wait()
+		}(500)
+	} else { // InsertMany批量插入成功
+		sucessNum = int64(docsNum)
 	}
-	logger.Info("collection插入数据完成", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.Int64("sucessNum", sucessNum), zap.Int64("failNum", failNum))
+	logger.Info("InsertMany批量插入数据", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.Int64("docsNum", docsNum), zap.Int64("sucessNum", sucessNum), zap.Int64("failNum", failNum))
 	return sucessNum, failNum
 }
 
@@ -790,7 +820,8 @@ func CustGetColls(src *MongoArgs, dbName string) []string {
 	var doc bson.M
 	var collnames []string
 	for cur.Next(context.Background()) {
-		cur.Decode(&doc)
+		err := cur.Decode(&doc)
+		CheckErr(err)
 		collnames = append(collnames, doc["name"].(string))
 	}
 	return collnames
