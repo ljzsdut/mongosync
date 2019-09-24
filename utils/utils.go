@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"log"
 	"reflect"
 	"strings"
@@ -14,6 +16,39 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+var (
+	logger *zap.Logger
+	ctx    context.Context = context.Background() // 永不超时
+)
+
+func init() {
+	logger = NewLogger()
+}
+func NewLogger() *zap.Logger {
+	cfg := zap.Config{
+		Level:       zap.NewAtomicLevelAt(zap.InfoLevel),
+		Development: true,
+		Encoding:    "json",
+		EncoderConfig: zapcore.EncoderConfig{
+			TimeKey:      "time",
+			LevelKey:     "level",
+			CallerKey:    "caller",
+			MessageKey:   "msg",
+			LineEnding:   zapcore.DefaultLineEnding,
+			EncodeLevel:  zapcore.LowercaseLevelEncoder,
+			EncodeTime:   zapcore.ISO8601TimeEncoder, // TimeKey对应的值（时间格式）
+			EncodeCaller: zapcore.ShortCallerEncoder, //CallerKey对应的值
+		},
+		OutputPaths:      []string{"stdout", "./zap.log"},
+		ErrorOutputPaths: []string{"stderr", "./zap.log"},
+	}
+	logger, err := cfg.Build()
+	if err != nil {
+		panic(err)
+	}
+	return logger
+}
 
 type NsMap struct {
 	SrcDb   string
@@ -33,13 +68,13 @@ type MongoArgs struct {
 
 type OPLOG struct {
 	TS primitive.Timestamp `bson:"ts"`
-	T  int64 `bson:"t"`
-	H  int64 `bson:"h"`
-	V  int `bson:"v"`
-	OP string `bson:"op"`
-	NS string `bson:"ns"`
-	O2 interface{} `bson:"o2"`
-	O  interface{} `bson:"o"`
+	T  int64               `bson:"t"`
+	H  int64               `bson:"h"`
+	V  int                 `bson:"v"`
+	OP string              `bson:"op"`
+	NS string              `bson:"ns"`
+	O2 interface{}         `bson:"o2"`
+	O  interface{}         `bson:"o"`
 }
 
 // MongoArgs的构造函数
@@ -127,7 +162,7 @@ func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, ds
 	defer srcClient.Disconnect(srcMongo.ctx)
 	srcColl := srcClient.Database(srcDbName).Collection(srcCollName)
 	// ctx:=srcMongo.ctx
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	cur, err := srcColl.Indexes().List(ctx) // 查看所有的索引
 	if err != nil {
 		log.Fatal("查看索引失败：", err)
@@ -186,7 +221,7 @@ func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, ds
 			indexmodel.Keys = value
 			indexmodel.Options = indexopt
 		}
-		ctx, _ = context.WithTimeout(context.Background(), 30*time.Second)
+		//ctx, _ = context.WithTimeout(context.Background(), 30*time.Second)
 		dstClient := dstMongo.Connect()
 		defer dstClient.Disconnect(dstMongo.ctx)
 		dstColl := dstClient.Database(dstDbName).Collection(dstCollName)
@@ -198,6 +233,7 @@ func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, ds
 }
 
 func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string, updateOverwrite bool, no_index bool) {
+	start := time.Now()
 	// TODO: 处理网络断开，自动重连——比如dbserver重启后自动重连
 
 	// 同步索引
@@ -205,11 +241,16 @@ func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName strin
 		CustSyncIndex(srcMongo, srcDbName, srcCollName, dstMongo, dstDbName, dstCollName)
 	}
 	// 同步文档
+	// 连接src数据库
 	srcClient := srcMongo.Connect()
 	defer srcClient.Disconnect(srcMongo.ctx)
 	srcColl := srcClient.Database(srcDbName).Collection(srcCollName)
-	// ctx:=srcMongo.ctx
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+	// 连接dst数据库
+	dstClient := dstMongo.Connect()
+	defer dstClient.Disconnect(dstMongo.ctx)
+	dstColl := dstClient.Database(dstDbName).Collection(dstCollName)
+	//ctx:=srcMongo.ctx
+	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	//创建findoptions参数
 	findOpts := options.Find()
 	findOpts.SetCursorType(options.NonTailable)
@@ -217,27 +258,15 @@ func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName strin
 	findOpts.SetNoCursorTimeout(true)
 	filter := bson.M{}
 	cur, err := srcColl.Find(ctx, filter, findOpts)
-	// cur.Err()
-	if err != nil {
-		log.Fatal("查看documents失败：", err)
-	}
+	CheckErr(err)
 	defer cur.Close(ctx)
 
-	// 连接dst数据库
-	dstClient := dstMongo.Connect()
-	defer dstClient.Disconnect(dstMongo.ctx)
-	dstColl := dstClient.Database(dstDbName).Collection(dstCollName)
-
 	//处理cur，并插入
-	// var doc bson.D
 	var doc interface{}
 	var docs []interface{}
-	var docNum uint64
+	var docNum, insertedNum int64
 
 	for cur.Next(ctx) {
-		if err := cur.Err(); err != nil {
-			log.Fatal(err)
-		}
 		err := cur.Decode(&doc)
 		// cur.Current // bson.Raw数据类型
 		// cur.Current.Lookup("key1", "key2") //判断是否含有某个键
@@ -245,88 +274,93 @@ func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName strin
 		// instock.Value()
 		// instock.Array().Values()
 		if err != nil {
-			log.Fatal("Decode document into variable err:", err)
+			logger.Fatal(err.Error())
 		} else {
-			docs = append(docs, doc)
 			docNum++
+			docs = append(docs, doc)
 		}
-		if docNum%100 == 0 { // 插入  ,此处可以控制批量插入的条数。可以设置1w/次
-			err := CustInsertMany(dstColl, docs, updateOverwrite)
-			if err == nil {
+		if docNum%10000 == 0 { // 插入  ,此处可以控制批量插入的条数。可以设置1w/次
+			sucessNum, failNum := CustInsertMany(dstColl, docs, updateOverwrite)
+			if failNum != 0 {
+				logger.Fatal("insert data err！")
+			} else {
+				insertedNum += sucessNum
 				docs = []interface{}{}
 			}
 		}
 	}
 	if len(docs) > 0 {
-		err := CustInsertMany(dstColl, docs, updateOverwrite)
-		if err != nil {
+		sucessNum, failNum := CustInsertMany(dstColl, docs, updateOverwrite)
+		if failNum != 0 {
+			logger.Fatal("insert data err！")
+		} else {
+			insertedNum += sucessNum
 			docs = []interface{}{}
 		}
 	}
-	log.Printf("%s.%s数据同步完成，共同步数据%d条", srcDbName, srcCollName, docNum)
+	end := time.Now()
+	duration := end.Sub(start).Seconds()
+	//logger.Info("collection数据导入完成",zap.String("NS",srcDbName+"."+srcCollName),zap.Int64("insertedCount",insertedNum))
+	fmt.Printf("%s数据导入完成，导入数量：%v\n，耗时：%v秒", srcDbName+"."+srcCollName, insertedNum, duration)
 }
 
 // 对mongo.Collection对象进行批量插入，如果批量插入失败，则转换为逐条插入
-func CustInsertMany(coll *mongo.Collection, docs []interface{}, updateOverwrite bool) error {
+func CustInsertMany(coll *mongo.Collection, docs []interface{}, updateOverwrite bool) (sucessNum int64, failNum int64) {
 	// 设置	InsertMany相关参数
+	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	insertManyOpts := options.InsertMany()
 	insertManyOpts.SetOrdered(true)
-	insertManyOpts.SetBypassDocumentValidation(false)
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+	insertManyOpts.SetBypassDocumentValidation(false) //Mongodb提供了在插入和更新时验证文档的功能。就是一种约束条件
 
-	_, err := coll.InsertMany(ctx, docs, insertManyOpts)
+	insertManyResult, err := coll.InsertMany(context.Background(), docs, insertManyOpts)
+	insertedlen := int64(len(insertManyResult.InsertedIDs))
 	if err != nil {
 		for _, doc := range docs {
-			err := CustInsertOne(coll, doc, updateOverwrite)
+			// 设置	InsertOne相关参数
+			insertOneOpts := options.InsertOne()
+			insertOneOpts.SetBypassDocumentValidation(false)
+			//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+
+			insertOneResult, err := coll.InsertOne(ctx, doc, insertOneOpts)
 			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
+				// 如果是违反唯一约束，说明记录已经插入了，更新操作或跳过;否则记录错误
+				if strings.Contains(err.Error(), "E11000 duplicate key error") {
+					// 是否对重复记录采用update
+					if updateOverwrite { // 采用replaceOne方式，覆盖已经存在的_id记录
+						// 设置	InsertOne相关参数
+						ReplaceOneOpts := options.Replace()
+						ReplaceOneOpts.SetBypassDocumentValidation(false)
+						ReplaceOneOpts.SetUpsert(true)
+						//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+						filter := bson.M{"_id": doc.(bson.D).Map()["_id"]}
+						replaceOne, err := coll.ReplaceOne(ctx, filter, doc, ReplaceOneOpts)
+						if err != nil { // ReplaceOne操作失败，failNum加1
+							failNum++
+							logger.Error(err.Error(),  zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
+						} else {
+							sucessNum++
+							logger.Debug("ReplaceOne操作成功", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.String("UpsertedID", fmt.Sprintf("%v", replaceOne.UpsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
+						}
+					} else { // 忽略_id已经存在的记录，不做任何操作
+						sucessNum++
+						logger.Debug(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
+					}
+				} else { // 非违反唯一键约束的错误，failNum加1
+					failNum++
+					logger.Error(err.Error(), zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("doc", fmt.Sprintf("%v", doc)))
 
-// 对mongo.Collection对象进行逐条插入。如果updateOverwrite==true,则对_id已经存在的数据进行更新操作。默认为不更新。
-func CustInsertOne(coll *mongo.Collection, doc interface{}, updateOverwrite ...bool) error {
-	// 设置	InsertOne相关参数
-	insertOneOpts := options.InsertOne()
-	insertOneOpts.SetBypassDocumentValidation(false)
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-
-	_, err := coll.InsertOne(ctx, doc, insertOneOpts)
-	// 如果是违反唯一约束，说明记录已经插入了，更新操作或跳过;否则记录错误
-	if err != nil {
-		if strings.Contains(err.Error(), "E11000 duplicate key error") {
-			// 是否对重复记录采用update
-			if len(updateOverwrite) > 0 && updateOverwrite[0] == true {
-				// 或采用update方式.
-				err := CustReplaceOneBy_id(coll, doc)
-				if err != nil {
-					log.Printf("%v\t,document: \t %v\n", err, doc)
 				}
 			} else {
-				// 或直接打印警告信息，不做任何操作
-				log.Printf("[Warning]:%v\n", err)
+				sucessNum++
+				logger.Debug("insertOne操作成功",  zap.String("NS", coll.Database().Name()+"."+coll.Name()),zap.String("InsertedID", fmt.Sprintf("%v", insertOneResult.InsertedID)), zap.String("doc", fmt.Sprintf("%v", doc)))
 			}
-		} else {
-			return err
 		}
+	} else {  // InsertMany批量插入成功
+		sucessNum += int64(insertedlen)
+		logger.Debug("InsertMany批量插入数据", zap.String("NS", coll.Database().Name()+"."+coll.Name()),  zap.Int64("insertedlen", insertedlen), zap.String("InsertedIDs", fmt.Sprintf("%v", insertManyResult.InsertedIDs)))
 	}
-	return nil
-}
-
-func CustReplaceOneBy_id(coll *mongo.Collection, doc interface{}) error {
-	// 设置	InsertOne相关参数
-	ReplaceOneOpts := options.Replace()
-	ReplaceOneOpts.SetBypassDocumentValidation(false)
-	ReplaceOneOpts.SetUpsert(true)
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	filter := bson.M{"_id": doc.(bson.D)[0].Value}
-	_, err := coll.ReplaceOne(ctx, filter, doc, ReplaceOneOpts)
-	if err != nil {
-		return err
-	}
-	return nil
+	logger.Info("collection插入数据完成", zap.String("NS", coll.Database().Name()+"."+coll.Name()), zap.Int64("sucessNum", sucessNum), zap.Int64("failNum", failNum))
+	return sucessNum, failNum
 }
 
 // 获取当前最新的oplog对应的timestamp：需要访问admin权限
@@ -428,7 +462,7 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 	defer cur.Close(context.Background())
 
 	var (
-		oplog OPLOG
+		oplog      OPLOG
 		oplogBsonD primitive.D
 	)
 	//var oplog_bsonD bson.D // TODO: bson.D格式的处理
@@ -490,18 +524,18 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 				}
 			case "u":
 				if _, exists := oplog.O.(bson.D).Map()["$set"]; exists {
-					UpdateOpts:=options.Update()
+					UpdateOpts := options.Update()
 					UpdateOpts.SetUpsert(true)
 					UpdateOpts.SetBypassDocumentValidation(false)
 
-					_, err := dstColl.UpdateOne(context.Background(), oplog.O2,oplog.O,UpdateOpts)  // update操作
+					_, err := dstColl.UpdateOne(context.Background(), oplog.O2, oplog.O, UpdateOpts) // update操作
 					if err != nil {
 						log.Println("oplog执行'u'操作失败：", err, "\toplog内容：", oplogBsonD)
 					}
 				} else {
 					ReplaceOneOpts := options.Replace()
 					ReplaceOneOpts.SetUpsert(true)
-					_, err := dstColl.ReplaceOne(context.Background(), oplog.O2,oplog.O,ReplaceOneOpts)  // replace操作
+					_, err := dstColl.ReplaceOne(context.Background(), oplog.O2, oplog.O, ReplaceOneOpts) // replace操作
 					if err != nil {
 						log.Println("oplog执行'u'操作失败：", err, "\toplog内容：", oplogBsonD)
 					}
@@ -799,5 +833,11 @@ func CustFilter(ns string, nsnsMap map[string]string) *NsMap {
 			DstDb:   strings.SplitN(ns, ".", 2)[0],
 			DstColl: strings.SplitN(ns, ".", 2)[1],
 		}
+	}
+}
+
+func CheckErr(err error) {
+	if err != nil {
+		logger.Error(err.Error())
 	}
 }
