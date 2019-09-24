@@ -309,7 +309,7 @@ func CustInsertMany(coll *mongo.Collection, docs []interface{}, updateOverwrite 
 	// 设置	InsertMany相关参数
 	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	insertManyOpts := options.InsertMany()
-	insertManyOpts.SetOrdered(false)                  // true:按docs顺序逐条插入，遇到错误，终止插入；  false：:按docs顺序逐条插入，遇到错误，跳过错误的记录，继续插入后面的记录
+	insertManyOpts.SetOrdered(true)                  // true:按docs顺序逐条插入，遇到错误，终止插入；  false：:按docs顺序逐条插入，遇到错误，跳过错误的记录，继续插入后面的记录
 	insertManyOpts.SetBypassDocumentValidation(false) //Mongodb提供了在插入和更新时验证文档的功能。就是一种约束条件
 
 	docsNum := int64(len(docs))
