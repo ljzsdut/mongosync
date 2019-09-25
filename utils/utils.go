@@ -20,7 +20,7 @@ import (
 
 var (
 	logger *zap.Logger
-	ctx    context.Context = context.Background() // 永不超时
+	ctx    = context.Background() // 永不超时
 )
 
 func init() {
@@ -233,12 +233,12 @@ func CustSyncIndex(srcMongo *MongoArgs, srcDbName string, srcCollName string, ds
 	}
 }
 
-func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string, updateOverwrite bool, no_index bool) {
+func CustSyncCollection(srcMongo *MongoArgs, srcDbName string, srcCollName string, dstMongo *MongoArgs, dstDbName string, dstCollName string, updateOverwrite bool, noIndex bool) {
 	start := time.Now()
 	// TODO: 处理网络断开，自动重连——比如dbserver重启后自动重连
 
 	// 同步索引
-	if !no_index {
+	if !noIndex {
 		CustSyncIndex(srcMongo, srcDbName, srcCollName, dstMongo, dstDbName, dstCollName)
 	}
 	// 同步文档
@@ -309,7 +309,7 @@ func CustInsertMany(coll *mongo.Collection, docs []interface{}, updateOverwrite 
 	// 设置	InsertMany相关参数
 	//ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	insertManyOpts := options.InsertMany()
-	insertManyOpts.SetOrdered(true)                  // true:按docs顺序逐条插入，遇到错误，终止插入；  false：:按docs顺序逐条插入，遇到错误，跳过错误的记录，继续插入后面的记录
+	insertManyOpts.SetOrdered(true)                   // true:按docs顺序逐条插入，遇到错误，终止插入；  false：:按docs顺序逐条插入，遇到错误，跳过错误的记录，继续插入后面的记录
 	insertManyOpts.SetBypassDocumentValidation(false) //Mongodb提供了在插入和更新时验证文档的功能。就是一种约束条件
 
 	docsNum := int64(len(docs))
@@ -419,11 +419,11 @@ func CustGetLatestOplogTimestamp(srcMongo *MongoArgs) (primitive.Timestamp, erro
 }
 
 // 对指定的ns进行oplog重放,oplog来自srcMongo对应实例的srcOplogNamespace集合。
-// 如果end_ts=primitive.Timestamp{}，默认行为为实时重放oplog。即使用tail模式的游标
+// 如果endTS=primitive.Timestamp{}，默认行为为实时重放oplog。即使用tail模式的游标
 // srcOplogNamespace表示oplog存放的collection，如果为空字符串，则表示使用默认的"local.oplog.rs"
 // nsSlice表示仅对这些ns进行oplog replay；
 // nsnsMap 表示对这里面的ns进行名称空间映射；
-func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.Timestamp, srcOplogNamespace string, nsSlice []string, nsnsMap map[string]string) {
+func CustReplayOplog(srcMongo, dstMongo *MongoArgs, startTS, endTS primitive.Timestamp, srcOplogNamespace string, nsSlice []string, nsnsMap map[string]string) {
 	var err error
 	//oplog来源集合，srcOplogNsSlice格式为：[local,oplog.rs]
 	if srcOplogNamespace == "" {
@@ -440,16 +440,16 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 	defer dstClient.Disconnect(context.Background())
 
 	srcColl := srcClient.Database(srcOplogNsSlice[0]).Collection(srcOplogNsSlice[1])
-	// 验证start_ts有效性，如果失效，直接退出。
+	// 验证startTS有效性，如果失效，直接退出。
 	var firstoplog bson.M
-	err = srcColl.FindOne(context.Background(), bson.M{"ts": bson.M{"$gte": start_ts}}).Decode(&firstoplog)
+	err = srcColl.FindOne(context.Background(), bson.M{"ts": bson.M{"$gte": startTS}}).Decode(&firstoplog)
 	if err != nil {
-		log.Fatalln("验证start_ts有效性时，查询失败：", err)
-	} else if !firstoplog["ts"].(primitive.Timestamp).Equal(start_ts) {
-		log.Fatalf("由于固定集合%s的size太小或者全量备份时间太长，导致start_ts指定的那条oplog记录已经被覆盖，终止oplog重放操作!请使用--sync_oplog参数重新进行同步操作，此时会将oplog记录到目标mongodb中的syncoplog.oplog.rs中，然后使用--replayoplog参数手动重放", srcOplogNamespace)
+		log.Fatalln("验证startTS有效性时，查询失败：", err)
+	} else if !firstoplog["ts"].(primitive.Timestamp).Equal(startTS) {
+		log.Fatalf("由于固定集合%s的size太小或者全量备份时间太长，导致startTS指定的那条oplog记录已经被覆盖，终止oplog重放操作!请使用--sync_oplog参数重新进行同步操作，此时会将oplog记录到目标mongodb中的syncoplog.oplog.rs中，然后使用--replayoplog参数手动重放", srcOplogNamespace)
 	}
 	// Tailable游标只能用在固定集合上,如果oplog来源自local.oplog.rs，则使用Tailable，否则使用NonTailable
-	// 判断end_ts是否为空,如果为空，则或者从start_ts开始的所有记录
+	// 判断endTS是否为空,如果为空，则或者从startTS开始的所有记录
 	var filter bson.D
 	findOpts := options.Find()
 	if srcOplogNamespace == "local.oplog.rs" {
@@ -459,10 +459,10 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 		findOpts.SetCursorType(options.NonTailable)
 		findOpts.SetNoCursorTimeout(true)
 	}
-	if end_ts.T == 0 && end_ts.I == 0 {
-		filter = bson.D{{"ts", bson.D{{"$gte", start_ts}}}}
+	if endTS.T == 0 && endTS.I == 0 {
+		filter = bson.D{{"ts", bson.D{{"$gte", startTS}}}}
 	} else {
-		filter = bson.D{{"$and", bson.D{{"ts", bson.M{"$gte": start_ts}}, {"ts", bson.M{"$lte": end_ts}}}}}
+		filter = bson.D{{"$and", bson.D{{"ts", bson.M{"$gte": startTS}}, {"ts", bson.M{"$lte": endTS}}}}}
 	}
 
 	// 判断 nsSlice中是否存在指定的 ns。
@@ -510,13 +510,13 @@ func CustReplayOplog(srcMongo, dstMongo *MongoArgs, start_ts, end_ts primitive.T
 			log.Fatal(err)
 		}
 		// 测试当前oplog是不是当前最新的oplog（新产生的oplog）。
-		// 只适用于固定集合local.oplog.rs。对于指定end_ts的情况（不为空）无需进行判断
-		if srcOplogNamespace == "local.oplog.rs" && end_ts.T == 0 && end_ts.I == 0 {
-			current_ts, err := CustGetLatestOplogTimestamp(srcMongo)
+		// 只适用于固定集合local.oplog.rs。对于指定endTS的情况（不为空）无需进行判断
+		if srcOplogNamespace == "local.oplog.rs" && endTS.T == 0 && endTS.I == 0 {
+			currentTS, err := CustGetLatestOplogTimestamp(srcMongo)
 			if err != nil {
 				log.Println("获取当前最新的oplog对应的timestamp失败：", err)
-			} else if current_ts.Equal(oplog.TS) {
-				//} else if current_ts.Equal(oplog[0].Value.(primitive.Timestamp)) {
+			} else if currentTS.Equal(oplog.TS) {
+				//} else if currentTS.Equal(oplog[0].Value.(primitive.Timestamp)) {
 				// 比较oplog中的timestamp和当前最新的timestamp是否相等
 				log.Println("正在实时重放当前最新生成的oplog，您可以\"ctrl+c\"手动终止程序!  当前oplog为:", oplogBsonD)
 			} else {
@@ -722,7 +722,7 @@ func CustGetOplogNs(oplog OPLOG) (string, string) {
 }
 
 // 从src库同步oplog到dst的库中，用于手动重放
-func CustSyncOplog(srcMongo *MongoArgs, dstMongo *MongoArgs, start_ts primitive.Timestamp) {
+func CustSyncOplog(srcMongo *MongoArgs, dstMongo *MongoArgs, startTS primitive.Timestamp) {
 	// TODO: 处理网络断开，自动重连——比如dbserver重启后自动重连
 	// TODO:  判断如果syncoplog库存在数据，退出
 
@@ -742,16 +742,16 @@ func CustSyncOplog(srcMongo *MongoArgs, dstMongo *MongoArgs, start_ts primitive.
 	findOpts := options.Find()
 	findOpts.SetCursorType(options.TailableAwait)
 	findOpts.SetNoCursorTimeout(true)
-	filter := bson.D{{"ts", bson.D{{"$gte", start_ts}}}}
+	filter := bson.D{{"ts", bson.D{{"$gte", startTS}}}}
 
-	// 验证start_ts有效性，如果失效，直接退出。
+	// 验证startTS有效性，如果失效，直接退出。
 	var firstoplog bson.M
 	time.Sleep(5e9)
 	err := srcColl.FindOne(context.Background(), filter).Decode(&firstoplog)
 	if err != nil {
-		log.Fatalln("验证start_ts有效性时，查询失败：", err)
-	} else if !firstoplog["ts"].(primitive.Timestamp).Equal(start_ts) {
-		log.Fatalln("start_ts指定的oplog已经失效，终止syncoplog操作")
+		log.Fatalln("验证startTS有效性时，查询失败：", err)
+	} else if !firstoplog["ts"].(primitive.Timestamp).Equal(startTS) {
+		log.Fatalln("startTS指定的oplog已经失效，终止syncoplog操作")
 	}
 
 	cur, err := srcColl.Find(context.Background(), filter, findOpts)
@@ -770,12 +770,12 @@ func CustSyncOplog(srcMongo *MongoArgs, dstMongo *MongoArgs, start_ts primitive.
 			log.Fatal("Decode oplog into variable err:", err)
 		}
 
-		current_ts, err := CustGetLatestOplogTimestamp(srcMongo)
+		currentTS, err := CustGetLatestOplogTimestamp(srcMongo)
 		if err != nil {
 			log.Println("获取当前最新的oplog对应的timestamp失败：", err)
-		} else if current_ts.Equal(oplog["ts"].(primitive.Timestamp)) {
+		} else if currentTS.Equal(oplog["ts"].(primitive.Timestamp)) {
 			// 比较oplog中的timestamp和当前最新的timestamp是否相等
-			log.Printf("正在实时同步最新生成的oplog到%s.%s，您可以'ctrl+c'手动终止程序!当前同步的oplog为:", dstDbName, dstCollName, oplog)
+			log.Printf("正在实时同步最新生成的oplog到%s.%s，您可以'ctrl+c'手动终止程序!当前同步的oplog为%s:", dstDbName, dstCollName, oplog)
 		}
 
 		dstColl := dstClient.Database(dstDbName).Collection(dstCollName)
